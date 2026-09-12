@@ -1,5 +1,6 @@
 #include "husb238a.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
 #include <cstring>
@@ -32,6 +33,24 @@ static float pdo_select_to_voltage(uint8_t pdo_select) {
       return 20.0f;
     default:
       return 0.0f;
+  }
+}
+
+// Mirrors pdo_select_to_voltage(), but as the option string the select platform publishes/expects.
+static const char *pdo_select_to_string(uint8_t pdo_select) {
+  switch (static_cast<PdoSelect>(pdo_select)) {
+    case PdoSelect::SRC_PDO_5V:
+      return "5V";
+    case PdoSelect::SRC_PDO_9V:
+      return "9V";
+    case PdoSelect::SRC_PDO_12V:
+      return "12V";
+    case PdoSelect::SRC_PDO_15V:
+      return "15V";
+    case PdoSelect::SRC_PDO_20V:
+      return "20V";
+    default:
+      return nullptr;
   }
 }
 
@@ -76,8 +95,31 @@ void Husb238aComponent::setup() {
 
   this->ready_ = true;
 
+  this->voltage_pref_ = global_preferences->make_preference<uint8_t>(fnv1_hash("husb238a_voltage") ^
+                                                                       this->get_i2c_address());
+
   // Populate SRC_PDO_xV.detect/current so the capabilities text sensor has real data.
   this->send_command_(GoCommandFunction::GET_SRC_CAP);
+
+  // GO_COMMAND actions each kick off a PD message exchange (AMS) that the chip processes
+  // asynchronously; issuing another one before that settles can clobber it. Wait the usual
+  // settle time before requesting the restored voltage, then again before the first status poll.
+  this->set_timeout(DEFER_UPDATE_DELAY_MS, [this]() {
+    this->restore_requested_voltage_();
+    this->defer_update();
+  });
+}
+
+void Husb238aComponent::restore_requested_voltage_() {
+  // The chip renegotiates its Type-C default (5V) on every power-up / hard reset, forgetting
+  // whatever fixed voltage was last requested over I2C. Re-request it here so a reboot doesn't
+  // silently drop the board back to 5V. Falls back to 5V itself when nothing was saved yet.
+  uint8_t stored = static_cast<uint8_t>(PdoSelect::SRC_PDO_5V);
+  this->voltage_pref_.load(&stored);
+
+  if (!this->command_request_pdo(static_cast<PdoSelect>(stored))) {
+    ESP_LOGW(TAG, "Failed to restore last requested PD voltage");
+  }
 }
 
 bool Husb238aComponent::enable_chip_() {
@@ -140,6 +182,19 @@ void Husb238aComponent::update() {
     RegSrcPdoSelect src_pdo{};
     if (this->read_byte(static_cast<uint8_t>(CommandRegister::SRC_PDO), &src_pdo.raw)) {
       this->selected_voltage_sensor_->publish_state(pdo_select_to_voltage(src_pdo.pdo_select));
+    }
+  }
+#endif
+
+#ifdef USE_SELECT
+  if (this->voltage_select_ != nullptr) {
+    // Keep the select in sync with what the chip actually has selected -- it otherwise never
+    // gets an initial state (shows "Unknown") until the user changes it themselves.
+    RegSrcPdoSelect src_pdo{};
+    if (this->read_byte(static_cast<uint8_t>(CommandRegister::SRC_PDO), &src_pdo.raw)) {
+      if (const char *option = pdo_select_to_string(src_pdo.pdo_select)) {
+        this->voltage_select_->publish_state(option);
+      }
     }
   }
 #endif
@@ -228,6 +283,10 @@ bool Husb238aComponent::command_request_pdo(PdoSelect voltage) {
     ESP_LOGV(TAG, "Send SELECT_PDO failed");
     return false;
   }
+
+  uint8_t stored = static_cast<uint8_t>(voltage);
+  this->voltage_pref_.save(&stored);
+
   return true;
 }
 

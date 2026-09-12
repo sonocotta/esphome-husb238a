@@ -3,6 +3,7 @@
 #include "esphome/components/i2c/i2c.h"
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
+#include "esphome/core/preferences.h"
 #ifdef USE_SENSOR
 #include "esphome/components/sensor/sensor.h"
 #endif
@@ -187,8 +188,10 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
   } registers_;
 
   bool ready_{false};
+  ESPPreferenceObject voltage_pref_;
 
   bool enable_chip_();
+  void restore_requested_voltage_();
   bool read_status_block_(bool &is_changed);
   bool send_command_(GoCommandFunction function);
   bool select_pdo_(PdoSelect voltage);

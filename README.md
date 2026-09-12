@@ -86,6 +86,15 @@ resistor-strapped GPIO mode where I2C is disabled entirely.
 | `text_sensor` | `capabilities` | Every voltage/current PDO the attached source advertises |
 | `select` | `voltage` | Request a specific fixed voltage (`5V`/`9V`/`12V`/`15V`/`20V`) from the source |
 
+### Voltage persistence
+
+The chip itself forgets any requested voltage across a power cycle or hard reset and renegotiates
+its Type-C default (5V). The driver works around this by saving the last requested voltage to flash
+and re-requesting it during `setup()`, so a reboot restores the previous voltage instead of silently
+dropping back to 5V. The `voltage` select also now reflects whatever `SRC_PDO` actually reports on
+every poll, instead of only updating in response to a user's own selection (which used to leave it
+showing "Unknown" until touched).
+
 ## Known limitations
 
 - Only fixed PDOs (5V/9V/12V/15V/20V) are supported. HUSB238A also supports PPS, AVS, and EPR
