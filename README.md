@@ -61,6 +61,11 @@ select:
     voltage: "Voltage selector"
 ```
 
+### ESPhome UI
+
+<img width="392" height="746" alt="image" src="https://github.com/user-attachments/assets/a93c1ab7-37f4-47a3-913d-6c6b2be85734" />
+
+
 ### Wiring notes
 
 The `ADDR/ORIENT` pin must be tied to `GND` or `VDD` (through the datasheet's recommended ~900kΩ
