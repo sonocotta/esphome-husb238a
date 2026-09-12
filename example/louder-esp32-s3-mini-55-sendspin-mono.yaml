@@ -99,6 +99,13 @@ network:
       # - firmware/esphome/packages/monitoring-wifi.yaml
 
 # ===== HUSB238A (local component under test) =====
+
+i2c:
+  sda: ${i2c_sda_pin}
+  scl: ${i2c_scl_pin}
+  scan: true
+  frequency: 400kHz
+
 external_components:
   - source:
       type: local
