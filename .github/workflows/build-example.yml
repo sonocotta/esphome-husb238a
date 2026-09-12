@@ -1,0 +1,50 @@
+name: Build Example
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'esphome/**'
+      - 'example/**'
+      - '.github/workflows/build-example.yml'
+  pull_request:
+    paths:
+      - 'esphome/**'
+      - 'example/**'
+      - '.github/workflows/build-example.yml'
+
+jobs:
+  prepare:
+    name: Prepare Build Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      configs: ${{ steps.find-configs.outputs.configs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find example configs
+        id: find-configs
+        run: |
+          configs=$(find example -maxdepth 1 -name "*.yaml" -type f | jq -R -s -c 'split("\n")[:-1]')
+          echo "configs=$configs" >> "$GITHUB_OUTPUT"
+          echo "Found configs:"
+          echo "$configs" | jq -r '.[]'
+
+  build:
+    name: Build ${{ matrix.config }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.prepare.outputs.configs) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ESPHome config
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/config" \
+            esphome/esphome:latest \
+            compile "/config/${{ matrix.config }}"
