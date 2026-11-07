@@ -6,6 +6,14 @@
 #include <cstring>
 #include <map>
 
+#ifdef USE_ESP32
+#include "soc/soc_caps.h"
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+#include <driver/usb_serial_jtag.h>
+#define HUSB238A_HAS_USJ 1
+#endif
+#endif
+
 namespace esphome {
 namespace husb238a {
 
@@ -114,18 +122,50 @@ void Husb238aComponent::setup() {
     return;
   }
 
-  // Cold start of the policy engine. Setting ENABLE makes the chip attach as a PD sink and wait
-  // for Source_Capabilities. A source only advertises them for a few seconds after the plug goes
-  // in; if we enable later than that (e.g. after flashing, or on a reset while plugged in), the
-  // sink hears nothing and -- as the PD spec requires -- issues a Hard Reset about 500 ms after
-  // attach. The source then removes VBUS for up to a second, the ESP32 brown-outs, and because
-  // the chip is powered from VBUS too it comes back with ENABLE clear, so a naive driver repeats
-  // this forever. Verified on the Louder-ESP32 Mini 55 with a Mac as source (FSM 0x02 -> 0x2A,
-  // then "E BOD: Brownout detector was triggered").
+  // Cold start of the policy engine. Two traps, both verified on a Louder-ESP32 Mini 55:
   //
-  // So: enable, watch the chip at high rate, and if the source hasn't talked to us within
-  // PROBE_WINDOW_MS, switch the engine off again before its Hard Reset timer expires. The board
-  // then simply stays on 5 V until the next real power cycle. See loop()/finish_enable_().
+  // 1. Setting ENABLE makes the chip attach as a PD sink and wait for Source_Capabilities. A
+  //    source only advertises them for a few seconds after the plug goes in; if we enable later
+  //    than that (after flashing, or on a reset while plugged in), the sink hears nothing and --
+  //    as the PD spec requires -- issues a Hard Reset about 500 ms after attach. The source then
+  //    removes VBUS for up to a second, the ESP32 brown-outs, and because the chip is powered from
+  //    VBUS too it comes back with ENABLE clear, so a naive driver repeats this forever (FSM 0x02
+  //    -> 0x2A, then "E BOD: Brownout detector was triggered"). So: enable, watch the chip at high
+  //    rate, and if the source hasn't talked to us within PROBE_WINDOW_MS switch the engine off
+  //    again before its Hard Reset timer expires. See loop()/finish_enable_().
+  //
+  // 2. When the board hangs off a computer, the PD contract itself kills the USB data link: macOS
+  //    (and some other hosts) only keep their data port enabled if the sink's Request carries the
+  //    "USB Communications Capable" bit, which this chip's factory configuration does not set. A
+  //    computer port only supplies 5 V anyway, so when the ESP32's own USB port sees a host we
+  //    simply don't start PD. See usb_host_attached_().
+  this->pd_state_ = PdState::PROBING;
+  this->set_timeout("husb238a_enable", HOST_CHECK_DELAY_MS, [this, control1]() {
+    if (this->skip_with_usb_host_ && this->usb_host_attached_()) {
+      this->pd_state_ = PdState::HOST_SKIPPED;
+      ESP_LOGI(TAG,
+               "USB host attached (board is plugged into a computer): not starting USB-PD, the host would drop the "
+               "USB data link once a contract is negotiated. Staying on the Type-C 5 V default.");
+#ifdef USE_TEXT_SENSOR
+      if (this->status_text_sensor_ != nullptr) {
+        this->status_text_sensor_->publish_state("Not negotiated (USB host attached)");
+      }
+      if (this->capabilities_text_sensor_ != nullptr) {
+        this->capabilities_text_sensor_->publish_state("Unknown (USB-PD not started)");
+      }
+#endif
+#ifdef USE_BINARY_SENSOR
+      if (this->attached_binary_sensor_ != nullptr) {
+        this->attached_binary_sensor_->publish_state(false);
+      }
+#endif
+      return;
+    }
+    this->start_policy_engine_(control1);
+  });
+}
+
+void Husb238aComponent::start_policy_engine_(RegControl1 control1) {
   control1.enable = true;
   if (!this->write_byte(static_cast<uint8_t>(CommandRegister::CONTROL1), control1.raw)) {
     ESP_LOGE(TAG, "Failed to enable HUSB238A");
@@ -133,12 +173,22 @@ void Husb238aComponent::setup() {
     return;
   }
   this->enable_time_ = millis();
-  this->pd_state_ = PdState::PROBING;
   this->high_freq_.start();
 }
 
+// True while the ESP32-S3/C3/C6 USB Serial/JTAG port receives SOF packets, i.e. a USB host is on
+// the other end of the cable. A charger or power bank never sends SOFs. Without that peripheral
+// (or on other chips) we cannot tell and assume there is no host.
+bool Husb238aComponent::usb_host_attached_() {
+#ifdef HUSB238A_HAS_USJ
+  return usb_serial_jtag_is_connected();
+#else
+  return false;
+#endif
+}
+
 void Husb238aComponent::loop() {
-  if (this->pd_state_ != PdState::PROBING) {
+  if (this->pd_state_ != PdState::PROBING || this->enable_time_ == 0) {
     return;
   }
   if (millis() - this->enable_time_ < PROBE_WINDOW_MS) {
@@ -347,10 +397,14 @@ void Husb238aComponent::dump_config() {
     case PdState::DISABLED:
       state = "disabled (source silent at boot, power cycle needed)";
       break;
+    case PdState::HOST_SKIPPED:
+      state = "not started (USB host attached)";
+      break;
     default:
       break;
   }
   ESP_LOGCONFIG(TAG, "  Policy engine: %s", state);
+  ESP_LOGCONFIG(TAG, "  Skip PD when a USB host is attached: %s", YESNO(this->skip_with_usb_host_));
 
 #ifdef USE_BINARY_SENSOR
   LOG_BINARY_SENSOR("  ", "PD Attached", this->attached_binary_sensor_);
@@ -410,6 +464,8 @@ bool Husb238aComponent::command_request_pdo(PdoSelect voltage) {
   if (!this->ready_) {
     if (this->pd_state_ == PdState::DISABLED) {
       ESP_LOGE(TAG, "USB-PD is disabled (source was silent at boot); power-cycle the board to negotiate");
+    } else if (this->pd_state_ == PdState::HOST_SKIPPED) {
+      ESP_LOGE(TAG, "USB-PD not started because a USB host is attached; use a charger for USB-PD");
     } else {
       ESP_LOGE(TAG, "Component not ready");
     }

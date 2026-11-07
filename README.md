@@ -118,6 +118,22 @@ the driver leaves the running contract alone.
 Voltage requests (the boot-time restore as well as the `voltage` select) are only sent for PDOs the
 source actually advertises, and the restore waits for the chip's own start-up negotiation to finish.
 
+### Plugged into a computer
+
+When the board hangs off a computer rather than a charger, the PD contract itself kills the USB data
+link: macOS (and some other hosts) only keep their data port enabled if the sink's Request carries the
+*USB Communications Capable* bit, which the HUSB238A's factory configuration does not set. A computer
+port only supplies 5 V anyway, so by default the driver does not start PD at all while the ESP32's own
+USB Serial/JTAG port sees a host (SOF packets). The `status` text sensor then reads
+`Not negotiated (USB host attached)`. Set `skip_with_usb_host: false` to negotiate regardless.
+
+```yaml
+husb238a:
+  id: husb_01
+  address: 0x42
+  skip_with_usb_host: true   # default
+```
+
 ## Known limitations
 
 - Only fixed PDOs (5V/9V/12V/15V/20V) are supported. HUSB238A also supports PPS, AVS, and EPR

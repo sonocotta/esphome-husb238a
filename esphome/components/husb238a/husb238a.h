@@ -137,8 +137,9 @@ union RegSrcPdoXxv {
 enum class PdState : uint8_t {
   IDLE,      // setup() not run yet
   PROBING,   // we just set CONTROL1.ENABLE and are waiting to see whether the source answers
-  RUNNING,   // policy engine enabled, PD requests allowed
-  DISABLED,  // source was silent: engine switched off again to avoid a Hard Reset (see setup())
+  RUNNING,      // policy engine enabled, PD requests allowed
+  DISABLED,     // source was silent: engine switched off again to avoid a Hard Reset (see setup())
+  HOST_SKIPPED, // a USB host is attached (board plugged into a computer): PD deliberately not started
 };
 
 class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
@@ -149,6 +150,8 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
   void loop() override;
   void update() override;
   void dump_config() override;
+
+  void set_skip_with_usb_host(bool skip) { this->skip_with_usb_host_ = skip; }
 
   bool command_request_voltage(int volt);
   bool command_request_voltage(const std::string &select_state);
@@ -188,6 +191,9 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
   static const uint32_t PROBE_WINDOW_MS = 300;
   // How long restore_requested_voltage_() waits for the chip's own start-up negotiation to finish.
   static const uint32_t RESTORE_TIMEOUT_MS = 3000;
+  // Delay between setup() and the enable decision, so the USB host detection (SOF packets on the
+  // ESP32's own USB port) has settled. Still well inside the few seconds a source keeps advertising.
+  static const uint32_t HOST_CHECK_DELAY_MS = 1000;
 
   struct {
     RegStatus status;
@@ -205,13 +211,16 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
   } registers_;
 
   bool ready_{false};
+  bool skip_with_usb_host_{true};
   PdState pd_state_{PdState::IDLE};
   uint32_t enable_time_{0};
   HighFrequencyLoopRequester high_freq_;
   ESPPreferenceObject voltage_pref_;
 
+  void start_policy_engine_(RegControl1 control1);
   void finish_enable_(bool source_is_talking);
   bool source_is_talking_();
+  bool usb_host_attached_();
   bool pdo_offered_(PdoSelect voltage);
   void restore_requested_voltage_();
   bool read_status_block_(bool &is_changed);
