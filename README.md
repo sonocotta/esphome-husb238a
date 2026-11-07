@@ -157,3 +157,34 @@ Register addresses and bit-field layout are cross-referenced from:
 ## License
 
 GPL-2.0, see [LICENSE](LICENSE).
+
+## Start-up voltage
+
+On power-up the HUSB238A negotiates its own, factory-configured contract before the ESP32 has even
+booted. On the Sonocotta boards that is the highest voltage the source offers (20 V on a 60 W
+charger). The component leaves that contract alone unless you have picked a voltage with the
+`Voltage selector`; a picked voltage is saved and re-requested after every reboot. Earlier versions
+forced 5 V at boot when nothing was saved, which stepped VBUS from 20 V down to 5 V while the rest
+of the board was still starting up.
+
+The `Contracted Voltage`, `Contracted Current`, `Capabilities` and `Voltage selector` entities are
+published right after the first poll, so Home Assistant shows the negotiated contract within a few
+seconds of boot.
+
+## Boot trace (debugging without a serial console)
+
+A board on a charger has no serial console. With `boot_trace: true` the component writes every
+start-up step (enable, source answered, voltage restored, ...) and a heartbeat every 10 s to flash,
+and prints the previous run's trace at the next boot, for example when the board is plugged into a
+computer again:
+
+```
+[I][husb238a]: Previous run (it started from reset reason 1), PD steps in order (uptime ms, contract0/contract1, caps mask [bit7 = Wi-Fi up]):
+[I][husb238a]:     1102 ms  0x00/0x00  0x00  policy engine enabled
+[I][husb238a]:     1402 ms  0x50/0x7D  0x1F  source answered, kept enabled
+[I][husb238a]:     1706 ms  0x50/0x7D  0x1F  saved voltage already active / none saved
+[I][husb238a]:     2010 ms  0x50/0x7D  0x1F  first status poll done
+[I][husb238a]:   120034 ms  0x50/0x7D  0x9F  still running (heartbeat)
+```
+
+It costs flash writes, so leave it off (the default) once the board behaves.

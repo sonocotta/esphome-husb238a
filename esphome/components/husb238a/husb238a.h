@@ -152,6 +152,7 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
   void dump_config() override;
 
   void set_skip_with_usb_host(bool skip) { this->skip_with_usb_host_ = skip; }
+  void set_boot_trace(bool enable) { this->boot_trace_ = enable; }
 
   bool command_request_voltage(int volt);
   bool command_request_voltage(const std::string &select_state);
@@ -210,8 +211,30 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
     RegSrcPdoXxv src_pdo_20v;
   } registers_;
 
+  // Optional boot trace (boot_trace: true): every PD start-up step, plus a heartbeat every 10 s, is
+  // written to flash so a run without a serial console (on a charger) can be read back at the next
+  // boot. Costs a handful of flash writes per boot and one every 10 s, so it is off by default.
+  struct __attribute__((packed)) Crumb {
+    uint8_t step;
+    uint8_t contract0;
+    uint8_t contract1;
+    uint8_t caps;
+    uint32_t ms;
+  };
+  static const uint8_t CRUMB_LOG_SIZE = 8;
+  struct __attribute__((packed)) CrumbLog {
+    uint8_t count;
+    uint8_t start_reason;  // esp_reset_reason() of the boot that wrote this log
+    Crumb entries[CRUMB_LOG_SIZE];
+  };
+  ESPPreferenceObject crumb_pref_;
+  CrumbLog crumb_log_{};
+  void crumb_(uint8_t step);
+
   bool ready_{false};
+  bool published_once_{false};
   bool skip_with_usb_host_{true};
+  bool boot_trace_{false};
   PdState pd_state_{PdState::IDLE};
   uint32_t enable_time_{0};
   HighFrequencyLoopRequester high_freq_;
@@ -220,6 +243,7 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
   void start_policy_engine_(RegControl1 control1);
   void finish_enable_(bool source_is_talking);
   bool source_is_talking_();
+  uint8_t effective_pdo_select_();
   bool usb_host_attached_();
   bool pdo_offered_(PdoSelect voltage);
   void restore_requested_voltage_();
