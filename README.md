@@ -95,6 +95,29 @@ dropping back to 5V. The `voltage` select also now reflects whatever `SRC_PDO` a
 every poll, instead of only updating in response to a user's own selection (which used to leave it
 showing "Unknown" until touched).
 
+## Start-up behaviour and the Hard Reset trap
+
+`CONTROL1.ENABLE` does not just unlock `GO_COMMAND`: with the bit clear the chip's whole PD policy
+engine is off (datasheet, *Enable Control*) and the board runs on the Type-C 5 V default. Setting the
+bit makes the chip attach as a PD sink and wait for `Source_Capabilities`.
+
+A source only advertises its capabilities for a few seconds after the plug goes in. If the driver
+enables the chip later than that (typically right after flashing, or on any reset while the board is
+plugged in), the sink hears nothing and, as the USB PD specification requires, issues a **Hard Reset**
+about 500 ms after attach. The source then removes VBUS for up to a second, the ESP32 brown-outs, and
+since the HUSB238A is powered from VBUS too it comes back with `ENABLE` clear, so the cycle repeats on
+every boot. On a Louder-ESP32 Mini this showed up as `E BOD: Brownout detector was triggered` in a loop.
+
+The driver therefore enables the chip and watches it for 300 ms. If the source has sent capabilities,
+a contract or any PD traffic by then, the engine stays on. If not, the driver clears `ENABLE` again
+before the chip's Hard Reset timer fires, logs a warning, sets a component warning and reports
+`Disabled (power cycle needed)` on the `status` text sensor. The board then keeps running on 5 V; unplug
+it for a few seconds and plug it back in to get USB-PD. On a warm reboot where `ENABLE` is already set
+the driver leaves the running contract alone.
+
+Voltage requests (the boot-time restore as well as the `voltage` select) are only sent for PDOs the
+source actually advertises, and the restore waits for the chip's own start-up negotiation to finish.
+
 ## Known limitations
 
 - Only fixed PDOs (5V/9V/12V/15V/20V) are supported. HUSB238A also supports PPS, AVS, and EPR

@@ -3,6 +3,7 @@
 #include "esphome/components/i2c/i2c.h"
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/preferences.h"
 #ifdef USE_SENSOR
 #include "esphome/components/sensor/sensor.h"
@@ -132,11 +133,20 @@ union RegSrcPdoXxv {
   uint8_t raw;
 };
 
+// Lifecycle of the chip's PD policy engine as driven by this component, see setup().
+enum class PdState : uint8_t {
+  IDLE,      // setup() not run yet
+  PROBING,   // we just set CONTROL1.ENABLE and are waiting to see whether the source answers
+  RUNNING,   // policy engine enabled, PD requests allowed
+  DISABLED,  // source was silent: engine switched off again to avoid a Hard Reset (see setup())
+};
+
 class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
  public:
   Husb238aComponent() = default;
 
   void setup() override;
+  void loop() override;
   void update() override;
   void dump_config() override;
 
@@ -171,6 +181,13 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
 
  protected:
   static const uint32_t DEFER_UPDATE_DELAY_MS = 300;
+  // How long after CONTROL1.ENABLE we wait for the source to start talking before giving up.
+  // The chip issues a PD Hard Reset ~500 ms after attach when no Source_Capabilities arrive
+  // (SinkWaitCapTimer), so this must stay well below that. Source_Capabilities are re-sent every
+  // 100-200 ms while the source is advertising, so 300 ms is enough to catch them.
+  static const uint32_t PROBE_WINDOW_MS = 300;
+  // How long restore_requested_voltage_() waits for the chip's own start-up negotiation to finish.
+  static const uint32_t RESTORE_TIMEOUT_MS = 3000;
 
   struct {
     RegStatus status;
@@ -188,9 +205,14 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
   } registers_;
 
   bool ready_{false};
+  PdState pd_state_{PdState::IDLE};
+  uint32_t enable_time_{0};
+  HighFrequencyLoopRequester high_freq_;
   ESPPreferenceObject voltage_pref_;
 
-  bool enable_chip_();
+  void finish_enable_(bool source_is_talking);
+  bool source_is_talking_();
+  bool pdo_offered_(PdoSelect voltage);
   void restore_requested_voltage_();
   bool read_status_block_(bool &is_changed);
   bool send_command_(GoCommandFunction function);
