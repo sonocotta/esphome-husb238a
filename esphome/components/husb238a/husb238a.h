@@ -3,6 +3,7 @@
 #include "esphome/components/i2c/i2c.h"
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/preferences.h"
 #ifdef USE_SENSOR
 #include "esphome/components/sensor/sensor.h"
@@ -132,13 +133,26 @@ union RegSrcPdoXxv {
   uint8_t raw;
 };
 
+// Lifecycle of the chip's PD policy engine as driven by this component, see setup().
+enum class PdState : uint8_t {
+  IDLE,      // setup() not run yet
+  PROBING,   // we just set CONTROL1.ENABLE and are waiting to see whether the source answers
+  RUNNING,      // policy engine enabled, PD requests allowed
+  DISABLED,     // source was silent: engine switched off again to avoid a Hard Reset (see setup())
+  HOST_SKIPPED, // a USB host is attached (board plugged into a computer): PD deliberately not started
+};
+
 class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
  public:
   Husb238aComponent() = default;
 
   void setup() override;
+  void loop() override;
   void update() override;
   void dump_config() override;
+
+  void set_skip_with_usb_host(bool skip) { this->skip_with_usb_host_ = skip; }
+  void set_boot_trace(bool enable) { this->boot_trace_ = enable; }
 
   bool command_request_voltage(int volt);
   bool command_request_voltage(const std::string &select_state);
@@ -171,6 +185,16 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
 
  protected:
   static const uint32_t DEFER_UPDATE_DELAY_MS = 300;
+  // How long after CONTROL1.ENABLE we wait for the source to start talking before giving up.
+  // The chip issues a PD Hard Reset ~500 ms after attach when no Source_Capabilities arrive
+  // (SinkWaitCapTimer), so this must stay well below that. Source_Capabilities are re-sent every
+  // 100-200 ms while the source is advertising, so 300 ms is enough to catch them.
+  static const uint32_t PROBE_WINDOW_MS = 300;
+  // How long restore_requested_voltage_() waits for the chip's own start-up negotiation to finish.
+  static const uint32_t RESTORE_TIMEOUT_MS = 3000;
+  // Delay between setup() and the enable decision, so the USB host detection (SOF packets on the
+  // ESP32's own USB port) has settled. Still well inside the few seconds a source keeps advertising.
+  static const uint32_t HOST_CHECK_DELAY_MS = 1000;
 
   struct {
     RegStatus status;
@@ -187,10 +211,41 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
     RegSrcPdoXxv src_pdo_20v;
   } registers_;
 
+  // Optional boot trace (boot_trace: true): every PD start-up step, plus a heartbeat every 10 s, is
+  // written to flash so a run without a serial console (on a charger) can be read back at the next
+  // boot. Costs a handful of flash writes per boot and one every 10 s, so it is off by default.
+  struct __attribute__((packed)) Crumb {
+    uint8_t step;
+    uint8_t contract0;
+    uint8_t contract1;
+    uint8_t caps;
+    uint32_t ms;
+  };
+  static const uint8_t CRUMB_LOG_SIZE = 8;
+  struct __attribute__((packed)) CrumbLog {
+    uint8_t count;
+    uint8_t start_reason;  // esp_reset_reason() of the boot that wrote this log
+    Crumb entries[CRUMB_LOG_SIZE];
+  };
+  ESPPreferenceObject crumb_pref_;
+  CrumbLog crumb_log_{};
+  void crumb_(uint8_t step);
+
   bool ready_{false};
+  bool published_once_{false};
+  bool skip_with_usb_host_{true};
+  bool boot_trace_{false};
+  PdState pd_state_{PdState::IDLE};
+  uint32_t enable_time_{0};
+  HighFrequencyLoopRequester high_freq_;
   ESPPreferenceObject voltage_pref_;
 
-  bool enable_chip_();
+  void start_policy_engine_(RegControl1 control1);
+  void finish_enable_(bool source_is_talking);
+  bool source_is_talking_();
+  uint8_t effective_pdo_select_();
+  bool usb_host_attached_();
+  bool pdo_offered_(PdoSelect voltage);
   void restore_requested_voltage_();
   bool read_status_block_(bool &is_changed);
   bool send_command_(GoCommandFunction function);
