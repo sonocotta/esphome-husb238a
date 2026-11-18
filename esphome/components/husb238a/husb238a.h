@@ -30,6 +30,19 @@ enum class CommandRegister : uint8_t {
   GO_COMMAND = 0x18,
   SRC_PDO = 0x19,
   STATUS = 0x63,
+  // PD policy-engine state machine. Not in the status block (0x63..0x6E), so it needs its own read.
+  // Confirmed on hardware against a Louder-ESP32 Mini 55 PD; see PdFsm for the observed values.
+  PD_STATE = 0x90,
+};
+
+// Values of PD_STATE (0x90) observed on hardware. The register is not documented publicly; only
+// these five were seen, so treat anything else as "some intermediate state" rather than an error.
+enum class PdFsm : uint8_t {
+  IDLE = 0x01,          // policy engine off, or attached without PD
+  WAIT_SRC_CAP = 0x02,  // attached as a sink, waiting for Source_Capabilities
+  CAPS_RECEIVED = 0x05,  // Source_Capabilities in, negotiating
+  CONTRACT = 0x06,      // explicit contract in place
+  HARD_RESET = 0x2A,    // PD Hard Reset -- the source is about to remove VBUS
 };
 
 // STATUS(0x63) .. SRC_PDO_20V(0x6E), read as one contiguous block.
@@ -195,6 +208,8 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
   // Delay between setup() and the enable decision, so the USB host detection (SOF packets on the
   // ESP32's own USB port) has settled. Still well inside the few seconds a source keeps advertising.
   static const uint32_t HOST_CHECK_DELAY_MS = 1000;
+  // boot_trace heartbeats to keep before giving up (10 s apart, so ~5 minutes).
+  static const uint16_t HEARTBEAT_MAX_BEATS = 30;
 
   struct {
     RegStatus status;
@@ -203,6 +218,9 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
     uint8_t dpdm_status;
     RegContractStatus0 contract_status0;
     uint8_t contract_status1;
+    // 0x69. Read for completeness but deliberately unused: measured 0x16/0x1E on one source and
+    // 0x00 on another that was simultaneously advertising all five PDOs, so it is not a usable
+    // "capabilities present" flag. Use the SRC_PDO_xV.detect bits instead.
     uint8_t source_cap_info;
     RegSrcPdoXxv src_pdo_5v;
     RegSrcPdoXxv src_pdo_9v;
@@ -231,6 +249,11 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
   CrumbLog crumb_log_{};
   void crumb_(uint8_t step);
 
+  // Last value read from PD_STATE (0x90). 0 means "not read yet".
+  uint8_t pd_fsm_{0};
+  uint8_t pd_fsm_logged_{0};
+  uint16_t heartbeat_count_{0};
+
   bool ready_{false};
   bool published_once_{false};
   bool skip_with_usb_host_{true};
@@ -243,6 +266,12 @@ class Husb238aComponent : public PollingComponent, public i2c::I2CDevice {
   void start_policy_engine_(RegControl1 control1);
   void finish_enable_(bool source_is_talking);
   bool source_is_talking_();
+  bool read_pd_fsm_();
+  void log_pd_state_();
+  void publish_no_contract_();
+  bool pd_contract_active_() const {
+    return this->registers_.status1.pd_comm || this->registers_.contract_status0.pd_contract != 0;
+  }
   uint8_t effective_pdo_select_();
   bool usb_host_attached_();
   bool pdo_offered_(PdoSelect voltage);

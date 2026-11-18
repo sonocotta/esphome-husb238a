@@ -203,7 +203,16 @@ void Husb238aComponent::setup() {
   this->crumb_(CRUMB_SETUP);
   // Heartbeat every 10 s: tells how long the previous run lived when it ended without a console.
   if (this->boot_trace_) {
-    this->set_interval("husb238a_heartbeat", 10000, [this]() { this->crumb_(CRUMB_HEARTBEAT); });
+    this->set_interval("husb238a_heartbeat", 10000, [this]() {
+      // Each beat is a 66-byte NVS write. The point of the heartbeat is to show how long the
+      // previous run lived, which the first few minutes already answer, so stop after that rather
+      // than writing flash every 10 s for the lifetime of the board.
+      if (++this->heartbeat_count_ > HEARTBEAT_MAX_BEATS) {
+        this->cancel_interval("husb238a_heartbeat");
+        return;
+      }
+      this->crumb_(CRUMB_HEARTBEAT);
+    });
   }
 
   // HUSB238A gates its whole PD policy engine behind CONTROL1.ENABLE: with the bit clear the chip
@@ -252,23 +261,12 @@ void Husb238aComponent::setup() {
   this->set_timeout("husb238a_enable", HOST_CHECK_DELAY_MS, [this, control1]() {
     if (this->skip_with_usb_host_ && this->usb_host_attached_()) {
       this->pd_state_ = PdState::HOST_SKIPPED;
+      this->disable_loop();
       this->crumb_(CRUMB_HOST_SKIPPED);
       ESP_LOGI(TAG,
                "USB host attached (board is plugged into a computer): not starting USB-PD, the host would drop the "
                "USB data link once a contract is negotiated. Staying on the Type-C 5 V default.");
-#ifdef USE_TEXT_SENSOR
-      if (this->status_text_sensor_ != nullptr) {
-        this->status_text_sensor_->publish_state("Not negotiated (USB host attached)");
-      }
-      if (this->capabilities_text_sensor_ != nullptr) {
-        this->capabilities_text_sensor_->publish_state("Unknown (USB-PD not started)");
-      }
-#endif
-#ifdef USE_BINARY_SENSOR
-      if (this->attached_binary_sensor_ != nullptr) {
-        this->attached_binary_sensor_->publish_state(false);
-      }
-#endif
+      this->publish_no_contract_();
       return;
     }
     this->start_policy_engine_(control1);
@@ -298,10 +296,59 @@ bool Husb238aComponent::usb_host_attached_() {
 #endif
 }
 
+// PD_STATE (0x90) is the chip's own policy-engine state and is the only authoritative view of what
+// the PD exchange is doing; everything else has to be inferred. Kept as a separate read because it
+// sits far outside the status block.
+bool Husb238aComponent::read_pd_fsm_() {
+  uint8_t fsm = 0;
+  if (!this->read_byte(static_cast<uint8_t>(CommandRegister::PD_STATE), &fsm)) {
+    return false;
+  }
+  this->pd_fsm_ = fsm;
+  return true;
+}
+
+void Husb238aComponent::log_pd_state_() {
+  const char *name;
+  switch (static_cast<PdFsm>(this->pd_fsm_)) {
+    case PdFsm::IDLE:
+      name = "idle / no PD";
+      break;
+    case PdFsm::WAIT_SRC_CAP:
+      name = "waiting for Source_Capabilities";
+      break;
+    case PdFsm::CAPS_RECEIVED:
+      name = "capabilities received, negotiating";
+      break;
+    case PdFsm::CONTRACT:
+      name = "explicit contract";
+      break;
+    case PdFsm::HARD_RESET:
+      name = "HARD RESET";
+      break;
+    default:
+      name = "intermediate";
+      break;
+  }
+  ESP_LOGD(TAG, "PD state 0x%02X (%s)", this->pd_fsm_, name);
+}
+
 void Husb238aComponent::loop() {
   if (this->pd_state_ != PdState::PROBING || this->enable_time_ == 0) {
     return;
   }
+
+  // Abort early on an observed Hard Reset instead of waiting out the window. The fixed
+  // PROBE_WINDOW_MS only works while it stays below the chip's SinkWaitCapTimer, which the USB-PD
+  // spec allows to be as low as 310 ms; watching for the state directly removes that assumption.
+  if (this->read_pd_fsm_() && static_cast<PdFsm>(this->pd_fsm_) == PdFsm::HARD_RESET) {
+    ESP_LOGW(TAG, "PD Hard Reset seen %u ms after enabling the chip, disabling the policy engine now",
+             (unsigned) (millis() - this->enable_time_));
+    this->high_freq_.stop();
+    this->finish_enable_(false);
+    return;
+  }
+
   if (millis() - this->enable_time_ < PROBE_WINDOW_MS) {
     return;
   }
@@ -324,14 +371,22 @@ bool Husb238aComponent::source_is_talking_() {
       return true;
     }
   }
-  return this->registers_.status1.pd_comm || this->registers_.contract_status0.pd_contract != 0;
+  if (this->registers_.status1.pd_comm || this->registers_.contract_status0.pd_contract != 0) {
+    return true;
+  }
+  // Only CAPS_RECEIVED/CONTRACT count: WAIT_SRC_CAP means we attached and nobody has answered,
+  // which is exactly the case this probe exists to catch.
+  const auto fsm = static_cast<PdFsm>(this->pd_fsm_);
+  return fsm == PdFsm::CAPS_RECEIVED || fsm == PdFsm::CONTRACT;
 }
 
 void Husb238aComponent::finish_enable_(bool source_is_talking) {
   if (source_is_talking) {
     ESP_LOGI(TAG, "USB-PD source answered within %u ms, policy engine enabled", (unsigned) PROBE_WINDOW_MS);
+    this->log_pd_state_();
     this->pd_state_ = PdState::RUNNING;
     this->ready_ = true;
+    this->disable_loop();  // the probe is over; nothing else uses loop()
     this->crumb_(CRUMB_SOURCE_TALKING);
     // The chip is negotiating its own first contract right now; wait for that AMS to settle
     // before asking for the saved voltage, then again before the first status poll.
@@ -342,12 +397,20 @@ void Husb238aComponent::finish_enable_(bool source_is_talking) {
     return;
   }
 
+  // Read the FSM first: clearing ENABLE returns it to idle, so sampling afterwards would only ever
+  // report 0x01 and tell us nothing about why the probe failed. 0x02 means we attached and the
+  // source never answered; 0x2A means it answered with a Hard Reset.
+  if (this->read_pd_fsm_()) {
+    this->log_pd_state_();
+  }
+
   RegControl1 control1;
   if (this->read_byte(static_cast<uint8_t>(CommandRegister::CONTROL1), &control1.raw)) {
     control1.enable = false;
     this->write_byte(static_cast<uint8_t>(CommandRegister::CONTROL1), control1.raw);
   }
   this->pd_state_ = PdState::DISABLED;
+  this->disable_loop();
   this->crumb_(CRUMB_SOURCE_SILENT);
   ESP_LOGW(TAG,
            "No USB-PD source capabilities within %u ms of enabling the chip: the source stopped advertising "
@@ -357,19 +420,7 @@ void Husb238aComponent::finish_enable_(bool source_is_talking) {
            (unsigned) PROBE_WINDOW_MS);
   this->status_set_warning(LOG_STR("USB-PD disabled, power cycle needed"));
 
-#ifdef USE_BINARY_SENSOR
-  if (this->attached_binary_sensor_ != nullptr) {
-    this->attached_binary_sensor_->publish_state(false);
-  }
-#endif
-#ifdef USE_TEXT_SENSOR
-  if (this->status_text_sensor_ != nullptr) {
-    this->status_text_sensor_->publish_state("Disabled (power cycle needed)");
-  }
-  if (this->capabilities_text_sensor_ != nullptr) {
-    this->capabilities_text_sensor_->publish_state("Unknown (USB-PD disabled)");
-  }
-#endif
+  this->publish_no_contract_();
 }
 
 bool Husb238aComponent::pdo_offered_(PdoSelect voltage) {
@@ -476,14 +527,30 @@ void Husb238aComponent::update() {
     return;
   }
 
+  // STATUS.attach is a *Type-C* attach: it is set on a plain 5 V charger that speaks no PD at all.
+  // Reporting it as "USB-PD attached" claimed PD on sources that offered no PDOs and had no
+  // contract. Use the PD-level signals instead.
+  const bool pd_active = this->pd_contract_active_();
+
+  // One i2c read for both the sensor and the select, instead of one each.
+  const uint8_t pdo_select = this->effective_pdo_select_();
+
+  // Keep PD_STATE current and report it when it moves, so the PD exchange is visible in the log
+  // rather than having to be inferred from the contract and PDO bits.
+  if (this->read_pd_fsm_() && this->pd_fsm_ != this->pd_fsm_logged_) {
+    this->pd_fsm_logged_ = this->pd_fsm_;
+    this->log_pd_state_();
+  }
+
 #ifdef USE_BINARY_SENSOR
   if (this->attached_binary_sensor_ != nullptr) {
-    this->attached_binary_sensor_->publish_state(this->registers_.status.attach);
+    this->attached_binary_sensor_->publish_state(pd_active);
   }
 #endif
 
 #ifdef USE_SENSOR
   if (this->voltage_sensor_ != nullptr) {
+    // Type-C default (no explicit contract) really is 5 V, so attach alone is the right gate here.
     float voltage = this->registers_.status.attach
                         ? pd_contract_to_voltage(this->registers_.contract_status0.pd_contract)
                         : 0.0f;
@@ -491,13 +558,14 @@ void Husb238aComponent::update() {
   }
 
   if (this->current_sensor_ != nullptr) {
-    float current =
-        this->registers_.status.attach ? contract_current_to_amps(this->registers_.contract_status1) : 0.0f;
+    // CONTRACT_STATUS1 only means anything inside an explicit contract, and current_to_ma_()'s
+    // 500 mA offset made an empty register read as a plausible-looking 0.5 A. Report 0 instead.
+    float current = pd_active ? contract_current_to_amps(this->registers_.contract_status1) : 0.0f;
     this->current_sensor_->publish_state(current);
   }
 
   if (this->selected_voltage_sensor_ != nullptr) {
-    this->selected_voltage_sensor_->publish_state(pdo_select_to_voltage(this->effective_pdo_select_()));
+    this->selected_voltage_sensor_->publish_state(pdo_select_to_voltage(pdo_select));
   }
 #endif
 
@@ -505,7 +573,7 @@ void Husb238aComponent::update() {
   if (this->voltage_select_ != nullptr) {
     // Keep the select in sync with what the chip actually has selected -- it otherwise never
     // gets an initial state (shows "Unknown") until the user changes it themselves.
-    if (const char *option = pdo_select_to_string(this->effective_pdo_select_())) {
+    if (const char *option = pdo_select_to_string(pdo_select)) {
       this->voltage_select_->publish_state(option);
     }
   }
@@ -520,6 +588,50 @@ void Husb238aComponent::update() {
     this->capabilities_text_sensor_->publish_state(this->get_capabilities_());
   }
 #endif
+}
+
+// Both no-PD outcomes (source silent, or a USB host attached) leave the board on the Type-C 5 V
+// default. Publish that explicitly: without it the numeric entities are never published at all and
+// show as "Unknown" indefinitely, which reads as a broken component rather than a known state.
+void Husb238aComponent::publish_no_contract_() {
+#ifdef USE_BINARY_SENSOR
+  if (this->attached_binary_sensor_ != nullptr) {
+    this->attached_binary_sensor_->publish_state(false);
+  }
+#endif
+#ifdef USE_SENSOR
+  if (this->voltage_sensor_ != nullptr) {
+    this->voltage_sensor_->publish_state(5.0f);
+  }
+  if (this->current_sensor_ != nullptr) {
+    this->current_sensor_->publish_state(0.0f);
+  }
+#endif
+  // Each publish costs roughly 10 ms, so the rest goes into the next loop iteration to stay under
+  // ESPHome's 50 ms per-operation advisory.
+  this->set_timeout(0, [this]() {
+#ifdef USE_SENSOR
+    if (this->selected_voltage_sensor_ != nullptr) {
+      this->selected_voltage_sensor_->publish_state(5.0f);
+    }
+#endif
+#ifdef USE_SELECT
+    if (this->voltage_select_ != nullptr) {
+      this->voltage_select_->publish_state("5V");
+    }
+#endif
+#ifdef USE_TEXT_SENSOR
+    const bool skipped = this->pd_state_ == PdState::HOST_SKIPPED;
+    if (this->status_text_sensor_ != nullptr) {
+      this->status_text_sensor_->publish_state(skipped ? "Not negotiated (USB host attached)"
+                                                       : "Disabled (power cycle needed)");
+    }
+    if (this->capabilities_text_sensor_ != nullptr) {
+      this->capabilities_text_sensor_->publish_state(skipped ? "Unknown (USB-PD not started)"
+                                                            : "Unknown (USB-PD disabled)");
+    }
+#endif
+  });
 }
 
 void Husb238aComponent::dump_config() {
@@ -542,6 +654,11 @@ void Husb238aComponent::dump_config() {
       break;
   }
   ESP_LOGCONFIG(TAG, "  Policy engine: %s", state);
+  if (this->pd_state_ == PdState::PROBING) {
+    // dump_config() runs from setup(), before the HOST_CHECK_DELAY_MS/PROBE_WINDOW_MS decision has
+    // been taken, so this line would always say "probing source" and never report the outcome.
+    ESP_LOGCONFIG(TAG, "    (decision still pending; the outcome is logged a moment later)");
+  }
   ESP_LOGCONFIG(TAG, "  Skip PD when a USB host is attached: %s", YESNO(this->skip_with_usb_host_));
   ESP_LOGCONFIG(TAG, "  Boot trace in flash: %s", YESNO(this->boot_trace_));
 
@@ -610,10 +727,20 @@ bool Husb238aComponent::command_request_pdo(PdoSelect voltage) {
     }
     return false;
   }
-  if (!this->pdo_offered_(voltage)) {
+  // Fail open when the chip has reported no PDOs whatsoever: that means we have no capability data
+  // (nothing read yet, or a stale block), not that the source offers nothing. Refusing in that
+  // state would silently disable every voltage request and leave the select inert.
+  const bool have_caps = this->registers_.src_pdo_5v.detect || this->registers_.src_pdo_9v.detect ||
+                         this->registers_.src_pdo_12v.detect || this->registers_.src_pdo_15v.detect ||
+                         this->registers_.src_pdo_20v.detect;
+  if (have_caps && !this->pdo_offered_(voltage)) {
     ESP_LOGW(TAG, "%.0f V is not offered by this source (%s), not requesting it",
              pdo_select_to_voltage(static_cast<uint8_t>(voltage)), this->get_capabilities_().c_str());
     return false;
+  }
+  if (!have_caps) {
+    ESP_LOGW(TAG, "No source capabilities known yet; requesting %.0f V anyway",
+             pdo_select_to_voltage(static_cast<uint8_t>(voltage)));
   }
 
   if (!this->select_pdo_(voltage)) {
