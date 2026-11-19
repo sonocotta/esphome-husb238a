@@ -99,7 +99,13 @@ showing "Unknown" until touched).
 
 `CONTROL1.ENABLE` does not just unlock `GO_COMMAND`: with the bit clear the chip's whole PD policy
 engine is off (datasheet, *Enable Control*) and the board runs on the Type-C 5 V default. Setting the
-bit makes the chip attach as a PD sink and wait for `Source_Capabilities`.
+bit makes the chip attach as a PD sink and wait for `Source_Capabilities`. Nothing is negotiated
+before that point — the chip reports no contract until the driver enables it.
+
+The chip's own PD state is readable at register **`0x90`**. Values seen on hardware: `0x01` idle or
+no PD, `0x02` attached and waiting for `Source_Capabilities`, `0x05` capabilities received, `0x06`
+explicit contract, `0x2A` Hard Reset. The driver watches it during start-up so it can react to a
+Hard Reset as soon as the chip reports one.
 
 A source only advertises its capabilities for a few seconds after the plug goes in. If the driver
 enables the chip later than that (typically right after flashing, or on any reset while the board is
@@ -160,9 +166,11 @@ GPL-2.0, see [LICENSE](LICENSE).
 
 ## Start-up voltage
 
-On power-up the HUSB238A negotiates its own, factory-configured contract before the ESP32 has even
-booted. On the Sonocotta boards that is the highest voltage the source offers (20 V on a 60 W
-charger). The component leaves that contract alone unless you have picked a voltage with the
+Once the policy engine is enabled the HUSB238A negotiates its own, factory-configured contract
+without the ESP32 asking for anything. Which voltage that is depends on the charger and is **not**
+simply the highest one on offer: on a 45 W charger advertising 5/9/12/15 V at 3 A and 20 V at 2.2 A,
+a Mini 55 PD settled on **15 V at 3 A**, apparently preferring the current over the peak voltage.
+The component leaves that contract alone unless you have picked a voltage with the
 `Voltage selector`; a picked voltage is saved and re-requested after every reboot. Earlier versions
 forced 5 V at boot when nothing was saved, which stepped VBUS from 20 V down to 5 V while the rest
 of the board was still starting up.
